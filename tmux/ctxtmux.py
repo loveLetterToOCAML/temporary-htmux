@@ -9,7 +9,8 @@ Routes
     GET  /screen?since=N  the screen fragment, or 204 (htmx swaps nothing) if rev is still N
     POST /exec            form field `line`; runs the command, returns the screen fragment
 
-Windows: shift+click a pane -> `modal <id>` floats it (geometry saved per pane); again -> back in its box.
+Windows: shift+click a pane -> `modal <id>` floats it; any number at once, sized from the pane's box (small boxes grow
+more than big ones shrink, aspect kept); geometry saved per pane once you move/resize; again -> back in its box.
 Every clickable thing (pane, tab, command bar) is just `hx-post="/exec"` with a command line,
 so mouse, keyboard and typed commands all go through the same path.
 Drop htmx.min.js next to this file to serve it locally instead of from the CDN.
@@ -33,67 +34,80 @@ from ctxtmux_base import PALETTES, App, CmdError, Command, Pane, Split, clamp_bo
 app = App()
 lock = threading.Lock()
 rev = 0
-clients: dict[str, dict] = {}  # browser-tab id -> view state: current screen, window (modal) pane, window reduced?
+clients: dict[str, dict] = {}  # browser-tab id -> view state: current screen + its windows (modals) per screen
 LOCAL_HTMX = Path(__file__).with_name("htmx.min.js")
 HTMX_SRC = "/htmx.min.js" if LOCAL_HTMX.exists() else "https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"
 
 
 @contextmanager
 def as_client(cid: str):
-    """Run with this browser tab's view state loaded into `app` (current screen, open window), saved afterwards.
+    """Run with this browser tab's view state loaded into `app` (current screen, windows), mutated in place and kept.
     Screens, panes and contexts stay shared; only what *this tab is looking at* is per tab."""
-    st = clients.setdefault(cid, {"cur": "main", "modal": None, "modal_screen": None, "mini": False})
+    st = clients.setdefault(cid, {"cur": "main", "wins": {}, "mins": {}})
     app.cur = st["cur"] if st["cur"] in app.screens else next(iter(app.screens))
-    app.modal, app.modal_screen, app.mini = st["modal"], st["modal_screen"], st["mini"]
+    app.wins, app.mins = st["wins"], st["mins"]
     try:
         yield
     finally:
-        st.update(cur=app.cur, modal=app.modal, modal_screen=app.modal_screen, mini=app.mini)
+        st["cur"] = app.cur
 
 
 def _pane(pid: int | None) -> Pane | None:
     return next((p for p in panes(app.screen.root) if p.id == pid), None)
 
 
-def _modal_pane() -> Pane | None:
-    """The pane in this tab's window, if the window belongs to the screen being shown (checked per render, so a
-    screen switch never shows a stale window, not even for one response)."""
-    return _pane(app.modal) if app.modal is not None and app.modal_screen == app.cur else None
-
-
 @command("modal")
 class Modal(Command):
-    """Show a pane in a window (shift+click a pane). The same command on that pane puts it back in its box."""
+    """Show a pane in a window (shift+click a pane). Any number can be open; the same command closes it again."""
     id: int | None = Field(None, description="pane id (default: the focused pane)", json_schema_extra={"positional": True})
-    mini: bool = Field(False, description="reduce / expand the open window to its title bar")
+    mini: bool = Field(False, description="reduce / expand this pane's window to its title bar")
+    front: bool = Field(False, description="bring this pane's window to the front and focus the pane")
+    all: bool = Field(False, description="close every window of this screen")
 
     def run(self, app):
-        if self.mini:
-            if _modal_pane() is None:
-                raise CmdError("no window is open")
-            app.mini = not app.mini
+        wins = app.modals
+        if self.all:
+            wins.clear()
+            app.minis.clear()
             return
         pid = self.id if self.id is not None else app.pane.id
         pane = _pane(pid)
         if pane is None:
             raise CmdError(f"no pane {pid}")
-        app.screen.focus = pane  # the window's pane is the one you type into
-        closing = _modal_pane() is pane
-        app.modal, app.modal_screen, app.mini = (None, None, False) if closing else (pid, app.cur, False)
+        if self.mini or self.front:
+            if pid not in wins:
+                raise CmdError(f"pane {pid} has no window")
+            if self.mini:
+                app.minis.symmetric_difference_update({pid})
+            else:
+                wins.remove(pid)
+                wins.append(pid)
+        elif pid in wins:  # toggle: close
+            wins.remove(pid)
+            app.minis.discard(pid)
+        else:
+            wins.append(pid)  # open on top
+        app.screen.focus = pane  # you type into the pane whose window you just used
 
 
 @command("modalbox")
 class ModalBox(Command):
-    """Remember position and size of the open window for its pane (the page sends this after you move/resize it)."""
+    """Remember where a pane's window is and how big (the page sends this after you move or resize it)."""
+    id: int
     x: int
     y: int
     w: int
     h: int
 
     def run(self, app):
-        pane = _modal_pane()
-        if pane is not None:
-            pane.box = clamp_box(self.x, self.y, self.w, self.h)
+        pane = _pane(self.id)
+        if pane is None:
+            raise CmdError(f"no pane {self.id}")
+        pane.box = clamp_box(self.x, self.y, self.w, self.h)
+        if self.id in app.modals:  # touching a window raises it, like any window system
+            app.modals.remove(self.id)
+            app.modals.append(self.id)
+        app.screen.focus = pane
 
 
 def resize(path: str, ratio: str) -> None:
@@ -143,7 +157,7 @@ def tree(n, scr, path: str = "", grow: float = 1.0) -> str:
     col = scr.color_of(n)  # custom colour, else the screen's palette slot
     col = visible(col) if col else col  # too-dark palette colours (black, navy) are lifted so they show on the dark UI
     color = f";--pc:{col};--pcd:{col}b3" if col else ""  # validated #rrggbb; --pcd = 70% alpha
-    in_modal = _modal_pane() is n
+    in_modal = n.id in app.modals
     cls = "pane" + (" focus" if focus else "") + (" in-modal" if in_modal else "")
     body = ('<div class="ph">⧉ shown in a window — shift+click to bring it back</div>' if in_modal
             else f'<pre>{escape(chr(10).join(n.buf))}</pre>')
@@ -164,29 +178,35 @@ def prompt_span(oob: bool) -> str:
     return f'<span id="prompt"{" hx-swap-oob=true" if oob else ""}{accent_style()}>{escape(app.prompt())}</span>'
 
 
-def modal_html() -> str:
-    """The floating window: live content of a pane, which stays in the layout greyed out. Rendered with the screen,
-    so it updates with every swap; geometry is saved per pane (and in snapshots)."""
-    pane = _modal_pane()
-    if pane is None:
-        app.modal = app.modal_screen = None
-        return ""
-    c, col = app.contexts[pane.ctx], app.screen.color_of(pane)
-    style = ""
-    if pane.box:
-        x, y, bw, bh = pane.box  # keep at least the title bar reachable if the browser window got smaller
-        style += f"left:min({x}px,calc(100vw - 80px));top:min({y}px,calc(100vh - 40px));width:{bw}px;height:{bh}px;"
-    if col:
-        style += f"--pc:{visible(col)};"
-    cls = ' class="mini"' if app.mini else ""
-    st = f' style="{style}"' if style else ""
-    mini_btn = post_attrs("modal --mini", quiet=True)
-    close_btn = post_attrs(f"modal {pane.id}", quiet=True)
-    return (f'<div id="modal" data-pane="{pane.id}"{cls}{st}>'
-            f'<div class="mhead"><span>{pane.id} {escape(c.params.label())} <i>{c.id[:8]}</i></span>'
-            f'<button {mini_btn} title="{"expand" if app.mini else "reduce"}">{"▢" if app.mini else "–"}</button>'
-            f'<button {close_btn} title="back into its box">×</button></div>'
+def modals_html() -> str:
+    """Floating windows, one per pane in `app.modals` (bottom -> top). Each shows its pane's live content while the pane
+    stays in the layout, greyed. A window with no saved geometry is marked data-auto: the page sizes it from the pane's
+    current box (see autoBox in the script) and reveals it. Saved geometry is plain inline px."""
+    ids = {p.id for p in panes(app.screen.root)}
+    app.modals[:] = [i for i in app.modals if i in ids]  # panes closed since: drop their windows
+    app.minis.intersection_update(ids)
+    out = []
+    for z, pid in enumerate(app.modals):
+        pane = _pane(pid)
+        c, col = app.contexts[pane.ctx], app.screen.color_of(pane)
+        style = f"z-index:{50 + z};"
+        if pane.box:
+            x, y, bw, bh = pane.box  # keep at least the title bar reachable if the browser window got smaller
+            style += f"left:min({x}px,calc(100vw - 80px));top:min({y}px,calc(100vh - 40px));width:{bw}px;height:{bh}px;"
+        if col:
+            style += f"--pc:{visible(col)};"
+        mini = pid in app.minis
+        # No id on purpose: htmx "settles" style/class of same-id elements (old value first, new one 20 ms later), which
+        # would wipe the geometry the page script applies right after the swap.
+        attrs = (f' class="modal{" mini" if mini else ""}" data-pane="{pid}" data-top="{int(z == len(app.modals) - 1)}"'
+                 f' data-focus="{int(app.pane is pane)}"' + ("" if pane.box else " data-auto"))
+        out.append(
+            f'<div{attrs} style="{style}">'
+            f'<div class="mhead"><span>{pid} {escape(c.params.label())} <i>{c.id[:8]}</i></span>'
+            f'<button {post_attrs(f"modal {pid} --mini", quiet=True)} title="{"expand" if mini else "reduce"}">{"▢" if mini else "–"}</button>'
+            f'<button {post_attrs(f"modal {pid}", quiet=True)} title="back into its box">×</button></div>'
             f'<pre>{escape(chr(10).join(pane.buf))}</pre><div class="grip"></div></div>')
+    return "".join(out)
 
 
 def screen_html(oob_prompt: bool = True) -> str:
@@ -203,7 +223,7 @@ def screen_html(oob_prompt: bool = True) -> str:
            f'<div id="root">{tree(app.screen.root, app.screen)}</div>'
            f'<div id="tabs">{tabs}<span id="chips" title="palette {app.screen.palette + 1}/{len(PALETTES)} — ctrl+b p for the next one">{chips}</span>'
            f'<span id="hint">ctrl+b: % split-h &nbsp; " split-v &nbsp; x close &nbsp; '
-           f'o next &nbsp; ←↑↓→ pane &nbsp; c colour &nbsp; p palette &nbsp; shift+click: window</span></div>{modal_html()}</div>')
+           f'o next &nbsp; ←↑↓→ pane &nbsp; c colour &nbsp; p palette &nbsp; shift+click: window (several ok)</span></div>{modals_html()}</div>')
     return out + (prompt_span(True) if oob_prompt else "")
 
 
@@ -363,42 +383,43 @@ def selftest() -> None:
         lum = lambda x: (lambda r, g, b: .2126 * r + .7152 * g + .0722 * b)(*[(lambda v: v / 12.92 if v <= .04045 else ((v + .055) / 1.055) ** 2.4)(int(x[i:i + 2], 16) / 255) for i in (1, 3, 5)])
         worst = min((lum(V(x)) + .05) / (lum("#14161a") + .05) for p in P for x in p)
         print("worst drawn contrast over the 20 colours: %.1f" % worst)
-        # ---- window (modal): shift+click a pane -> `modal <id>`; geometry saved per pane; per-tab state
+        # ---- windows (modals): several at once, per pane, per tab, per screen
         F, G = {"X-Client": "tabF"}, {"X-Client": "tabG"}
         pf = lambda line, **kw: c.post("/exec", data={"line": line, **kw}, headers=F).text
         pg = lambda line, **kw: c.post("/exec", data={"line": line, **kw}, headers=G).text
-        is_open = lambda h: 'id="modal"' in h
-        pane_html = lambda h, i: re.search(rf'<div class="pane[^"]*" data-id="{i}".*?(?=<div class="pane|<div class="bar"|</div><div id="tabs">)', h, re.S).group(0)
-        pf("screen win"); pf("ps"); h = pf("split h")             # pane 1 has output, pane 2 is focused
-        unfocused = re.search(r'<div class="pane" data-id="1"[^>]*>', h).group(0)
-        print("unfocused pane: click focuses, shift+click does not:", 'hx-trigger="click[!shiftKey]"' in unfocused and "focus --id 1" in unfocused)
+        wins = lambda h: re.findall(r'<div class="modal[^"]*" data-pane="(\d+)"', h)                       # window order = z-order, bottom -> top
+        zs = lambda h: [int(z) for z in re.findall(r'<div class="modal[^"]*" data-pane="\d+"[^>]*style="z-index:(\d+)', h)]
+        top = lambda h: re.search(r'<div class="modal[^"]*" data-pane="(\d+)" data-top="1"', h).group(1)
+        win = lambda h, i: re.search(rf'<div class="modal[^"]*" data-pane="{i}"[^>]*>', h).group(0)
+        greyed = lambda h: re.findall(r'class="pane[^"]*in-modal[^"]*" data-id="(\d+)"', h)
+        pf("screen win"); pf("ps"); pf("split h"); pf("split h")          # panes 1,2,3; pane 1 has output; 3 focused
         h = pf("modal 1", quiet="1")
-        print("opens, shows pane 1 live content:", is_open(h) and 'data-pane="1"' in h and "$ ps" in h.split('id="modal"')[1])
-        print("pane 1 greyed with placeholder:", "in-modal" in pane_html(h, 1) and "bring it back" in pane_html(h, 1) and "<pre>" not in pane_html(h, 1),
-              "| pane 2 untouched:", "in-modal" not in pane_html(h, 2) and "<pre>" in pane_html(h, 2))
-        print("opening focuses that pane:", 'class="pane focus in-modal"' in h)
-        h = pf("modal 1", quiet="1")
-        print("same command again puts it back:", not is_open(h) and "$ ps" in pane_html(h, 1) and "in-modal" not in h)
-        pf("modal 2", quiet="1")
-        h = pf("modalbox 100 50 640 400", quiet="1")
-        print("geometry applied:", "left:min(100px" in h and "top:min(50px" in h and "width:640px;height:400px" in h)
-        h = pf("modalbox -5 3 10 10", quiet="1")
-        print("clamped (>=0, min 260x140):", "left:min(0px" in h and "width:260px;height:140px" in h)
-        pf("modalbox 100 50 640 400", quiet="1"); pf("modal 2", quiet="1")           # close
         h = pf("modal 2", quiet="1")
-        print("size saved per pane, restored on reopen:", "width:640px;height:400px" in h)
+        print("two windows at once:", wins(h) == ["1", "2"], "| both panes greyed:", sorted(greyed(h)) == ["1", "2"], "| z-order 1<2:", zs(h) == [50, 51], "| top is 2:", top(h) == "2")
+        print("window shows its pane's live content:", "$ ps" in h.split('data-pane="1"')[1].split("</pre>")[0])
+        print("unsaved windows are marked for proportional sizing:", "data-auto" in win(h, 1) and "data-auto" in win(h, 2),
+              "| no ids on windows:", 'id="modal' not in h)
+        h = pf("modal 1 --front", quiet="1")
+        print("--front raises + focuses:", wins(h) == ["2", "1"] and top(h) == "1" and 'class="pane focus in-modal" data-id="1"' in h)
         h = pf("modal 1", quiet="1")
-        print("another pane has its own default (no inline geometry):", "width:640px" not in h.split('id="modal"')[1].split(">")[0])
-        h = pf("modal --mini", quiet="1")
-        print("reduce / expand:", 'class="mini"' in h, "->", 'class="mini"' not in pf("modal --mini", quiet="1"))
-        print("per tab: tab G (same screen) has no window:", not is_open(pg("screen win")), "| F still has one:", is_open(pf("ps")))
-        print("leaving the screen closes the window:", not is_open(pf("screen main")) and not is_open(pf("screen win")))
-        print("errors: unknown pane:", "no pane 99" in pf("modal 99"), "| --mini with none open:", "no window is open" in pf("modal --mini"))
-        pf("modal 2", quiet="1"); pf("modalbox 120 60 500 300", quiet="1"); pf("save wintest")
-        h = pf("restore wintest --wipe")                # same screen stays current, so the window is still open
-        print("geometry survives save/restore:", is_open(h) and "left:min(120px" in h and "width:500px;height:300px" in h)
-        pf("close")                                    # closing the pane shown in a window must not leave a ghost window
-        print("closing the pane drops its window:", not is_open(pf("ps")))
+        print("toggle closes only that one:", wins(h) == ["2"] and greyed(h) == ["2"])
+        h = pf("modal 1", quiet="1"); h = pf("modal 2 --mini", quiet="1")
+        print("reduce is per window:", 'class="modal mini"' in win(h, 2) and 'class="modal"' in win(h, 1))
+        h = pf("modalbox 2 100 50 640 400", quiet="1")
+        print("saved geometry applied, no longer auto:", "left:min(100px" in win(h, 2) and "width:640px;height:400px" in win(h, 2) and "data-auto" not in win(h, 2),
+              "| other window still auto:", "data-auto" in win(h, 1), "| touching raised it:", top(h) == "2")
+        h = pf("modalbox 1 -5 3 10 10", quiet="1")
+        print("clamped (>=0, min 260x140):", "left:min(0px" in win(h, 1) and "width:260px;height:140px" in win(h, 1))
+        pf("modal --all"); h = pf("modal 2", quiet="1")
+        print("`modal --all` closes everything; geometry is remembered per pane:", "width:640px;height:400px" in win(h, 2))
+        print("per tab: tab G (same screen) has none:", wins(pg("screen win")) == [], "| F keeps its window:", wins(pf("ps")) == ["2"])
+        h = pf("screen main"); print("windows are kept per screen: hidden elsewhere:", wins(h) == [], end=" ")
+        print("| back again:", wins(pf("screen win")) == ["2"])
+        print("errors:", "no pane 99" in pf("modal 99"), "| --mini without window:", "has no window" in pf("modal 3 --mini"), "| --front without window:", "has no window" in pf("modal 3 --front"))
+        pf("modal 3", quiet="1"); pf("save wintest"); h = pf("restore wintest --wipe")
+        print("geometry survives save/restore:", "left:min(100px" in win(h, 2) and sorted(wins(h)) == ["2", "3"])
+        pf("focus --id 3"); pf("close")
+        print("closing a pane drops only its window:", wins(pf("ps")) == ["2"])
         print("poll unchanged ->", c.get("/screen", params={"since": rev}, headers=A).status_code)
         print("<script> escaped:", "<script>" not in c.post("/exec", data={"line": "<script>x"}, headers=B).text)
     srv.shutdown()
@@ -438,14 +459,15 @@ PAGE = r"""<!doctype html>
   #tabs button.cur { color: var(--bg); background: var(--accent); transition: background-color .15s; }
   .pane.in-modal { filter: grayscale(1); opacity: .45; }
   .ph { flex: 1; display: flex; align-items: center; justify-content: center; text-align: center; padding: 8px; color: var(--dim); }
-  #modal { position: fixed; z-index: 50; left: max(10vw, calc(50vw - 450px)); top: max(15vh, calc(50vh - 260px));
+  .modal { position: fixed; z-index: 50; left: max(10vw, calc(50vw - 450px)); top: max(15vh, calc(50vh - 260px));
            width: min(900px, 80vw); height: min(520px, 70vh); max-width: calc(100vw - 8px); max-height: calc(100vh - 8px);
            display: flex; flex-direction: column; background: var(--bg); border: 2px solid var(--pc, var(--accent));
            border-radius: 8px; box-shadow: 0 14px 44px rgba(0,0,0,.65); }
-  #modal.mini { height: auto !important; } #modal.mini pre, #modal.mini .grip { display: none; }
+  .modal[data-auto] { visibility: hidden; }  /* until the script has sized it from its pane */
+  .modal.mini { height: auto !important; } .modal.mini pre, .modal.mini .grip { display: none; }
   .mhead { display: flex; align-items: center; gap: 4px; padding: 4px 6px 4px 10px; cursor: move; user-select: none;
            border-bottom: 1px solid var(--line); color: var(--pc, var(--accent)); }
-  #modal.mini .mhead { border-bottom: 0; }
+  .modal.mini .mhead { border-bottom: 0; }
   .mhead span { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .mhead i { opacity: .6; font-style: normal; }
   .mhead button { background: none; border: 0; color: var(--fg); font: inherit; cursor: pointer; padding: 0 8px; border-radius: 4px; }
   .mhead button:hover { background: var(--line); }
@@ -471,6 +493,7 @@ const cid = sessionStorage.cid = sessionStorage.cid || Math.random().toString(36
 document.body.setAttribute('hx-headers', JSON.stringify({'X-Client': cid}));
 const cmd = document.getElementById('cmd');
 const settle = () => {
+  placeModals();
   document.querySelectorAll('#screen pre').forEach(p => p.scrollTop = p.scrollHeight);
   if (document.activeElement === document.body) cmd.focus();
 };
@@ -518,25 +541,52 @@ document.addEventListener('dblclick', ev => {
   const bar = ev.target.closest && ev.target.closest('.bar'); if (bar) sendResize(bar.dataset.path, 0.5);
 });
 
-// window (modal): move by its title bar, resize with the corner grip; geometry is saved per pane on release.
+// Windows. Unsaved ones are sized from their pane's current box: window "size" d' = D0 * (d/D0)^e with d = sqrt(w*h),
+// aspect ratio kept. e < 1 compresses: boxes below D0 grow (e=.5, fast), boxes above shrink (e=.8, gently), at D0 nothing
+// changes. Then capped to the viewport / 1100x780 and floored at 260x140 (that floor is the only thing that bends the ratio).
+function autoBox(r) {
+  const D0 = 420, GROW = 0.5, SHRINK = 0.8, d = Math.sqrt(r.width * r.height);
+  const k0 = (D0 * Math.pow(d / D0, d < D0 ? GROW : SHRINK)) / d;
+  let w = r.width * k0, h = r.height * k0;
+  const maxW = Math.min(1100, innerWidth * 0.92), maxH = Math.min(780, innerHeight * 0.9), k = Math.min(1, maxW / w, maxH / h);
+  w = Math.min(maxW, Math.max(260, w * k)); h = Math.min(maxH, Math.max(140, h * k));
+  // open slightly offset from the box, so its top-left strip (the greyed pane) stays clickable; keep it on screen
+  const x = Math.max(8, Math.min(r.left + 24, innerWidth - w - 8)), y = Math.max(8, Math.min(r.top + 24, innerHeight - h - 8));
+  return {x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h)};
+}
+function placeModals() {
+  document.querySelectorAll('.modal[data-auto]').forEach(m => {
+    const p = document.querySelector('.pane[data-id="' + m.dataset.pane + '"]');
+    if (!p) return;
+    const b = autoBox(p.getBoundingClientRect());
+    Object.assign(m.style, {left: b.x + 'px', top: b.y + 'px', width: b.w + 'px', height: b.h + 'px'});
+    m.removeAttribute('data-auto');
+  });
+}
+// Move by the title bar, resize with the corner grip; on release the geometry is saved per pane (and raises the window).
+// A plain click on a window that is not on top / whose pane is not focused raises + focuses it. Raising is local first
+// (z-index), so nothing is swapped while you are dragging.
+let zTop = 1000;
 document.addEventListener('pointerdown', ev => {
-  const m = ev.target.closest && ev.target.closest('#modal');
-  const head = m && ev.target.closest('.mhead'), grip = m && ev.target.closest('.grip');
-  if (!m || ev.target.closest('button') || !(head || grip)) return;
-  mdrag = {m, size: !!grip, ox: ev.clientX, oy: ev.clientY, r: m.getBoundingClientRect()};
-  (grip || head).setPointerCapture(ev.pointerId); ev.preventDefault();
+  const m = ev.target.closest && ev.target.closest('.modal');
+  if (!m || ev.target.closest('button')) return;
+  m.style.zIndex = ++zTop;
+  const grip = ev.target.closest('.grip'), head = ev.target.closest('.mhead');
+  mdrag = {m, mode: grip ? 'size' : head ? 'move' : 'click', ox: ev.clientX, oy: ev.clientY, r: m.getBoundingClientRect()};
+  if (mdrag.mode !== 'click') { (grip || head).setPointerCapture(ev.pointerId); ev.preventDefault(); }  // 'click': let text be selected
 });
 document.addEventListener('pointermove', ev => {
-  if (!mdrag) return;
-  const {m, size, ox, oy, r} = mdrag, dx = ev.clientX - ox, dy = ev.clientY - oy;
-  if (size) { m.style.width = Math.max(260, r.width + dx) + 'px'; m.style.height = Math.max(140, r.height + dy) + 'px'; }
+  if (!mdrag || mdrag.mode === 'click') return;
+  const {m, mode, ox, oy, r} = mdrag, dx = ev.clientX - ox, dy = ev.clientY - oy;
+  if (mode === 'size') { m.style.width = Math.max(260, r.width + dx) + 'px'; m.style.height = Math.max(140, r.height + dy) + 'px'; }
   else { m.style.left = Math.max(0, r.left + dx) + 'px'; m.style.top = Math.max(0, r.top + dy) + 'px'; }
 });
 document.addEventListener('pointerup', () => {
   if (!mdrag) return;
-  const {m, r} = mdrag, n = m.getBoundingClientRect(); mdrag = null;
+  const {m, r} = mdrag, n = m.getBoundingClientRect(), id = m.dataset.pane; mdrag = null;
   if ([n.left - r.left, n.top - r.top, n.width - r.width, n.height - r.height].some(v => Math.abs(v) > 2))
-    run(`modalbox ${Math.round(n.left)} ${Math.round(n.top)} ${Math.round(n.width)} ${Math.round(n.height)}`);
+    run(`modalbox ${id} ${Math.round(n.left)} ${Math.round(n.top)} ${Math.round(n.width)} ${Math.round(n.height)}`);
+  else if (m.dataset.top !== '1' || m.dataset.focus !== '1') run(`modal ${id} --front`);
 });
 
 // shift+click a pane (also a greyed one) -> window / back. Plain clicks and double-clicks keep their normal meaning
@@ -565,7 +615,7 @@ const run = line => htmx.ajax('POST', '/exec', {target: '#screen', swap: 'outerH
 document.addEventListener('keydown', ev => {
   if (['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock'].includes(ev.key)) return;  // `%` is Shift+5: don't eat the Shift
   if (ev.key === 'Escape' && !prefix) {            // Esc closes the window (back into its box)
-    const m = document.getElementById('modal');
+    const m = document.querySelector('.modal[data-top="1"]');   // Esc closes the top window
     if (m) { ev.preventDefault(); ev.stopPropagation(); run('modal ' + m.dataset.pane); }
     return;
   }

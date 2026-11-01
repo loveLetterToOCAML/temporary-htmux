@@ -387,14 +387,22 @@ class App:
         self.screens: dict[str, Screen] = {}
         self.cur = "main"
         self.alive = True
-        self.modal: int | None = None  # per-client view state, set by the web layer: pane shown in a window
-        self.mini = False              # ... and whether that window is reduced to its title bar
-        self.modal_screen: str | None = None  # ... and the screen it was opened on (pane ids are per screen)
+        # per-client view state, swapped in by the web layer: windows (modals) per screen, bottom -> top
+        self.wins: dict[str, list[int]] = {}   # screen name -> pane ids shown in windows
+        self.mins: dict[str, set[int]] = {}    # screen name -> windows reduced to their title bar
         self.typed = True  # False when a key shortcut / click triggered the command (no echo, no chatter)
         first = self.add_context(KINDS["notes"](topic="scratch"))
         self.screens["main"] = Screen.create("main", first.id)
 
     # -- state helpers
+    @property
+    def modals(self) -> list[int]:
+        return self.wins.setdefault(self.cur, [])
+
+    @property
+    def minis(self) -> set[int]:
+        return self.mins.setdefault(self.cur, set())
+
     screen = property(lambda s: s.screens[s.cur])
     pane = property(lambda s: s.screen.focus)
     ctx = property(lambda s: s.contexts[s.pane.ctx])
